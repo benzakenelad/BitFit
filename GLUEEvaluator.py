@@ -1,5 +1,6 @@
 import re
 from functools import reduce
+import os
 
 import torch
 import numpy as np
@@ -60,11 +61,10 @@ BIAS_TERMS_DICT = {
     'key': 'attention.self.key.bias',
     'query': 'attention.self.query.bias',
     'value': 'attention.self.value.bias',
-    'attention_output': 'attention.output.dense.bias',
+    'output': 'output.dense.bias',
     'output_layernorm': 'output.LayerNorm.bias',
     'attention_layernorm': 'attention.output.LayerNorm.bias',
-    'bias': 'bias',
-    'LayerNorm': 'LayerNorm',
+    'all': 'bias',
 }
 
 TASK_NAME_TO_SUBMISSION_FILE_NAME = {
@@ -147,7 +147,7 @@ class GLUEEvaluator():
     def convert_to_actual_components(components):
         return [BIAS_TERMS_DICT[component] for component in components]
 
-    def preprocess_dataset(self, test, padding, max_sequence_len, batch_size):
+    def preprocess_dataset(self, padding, max_sequence_len, batch_size):
         print(f'Downloading dataset: {self.task_name}')
         datasets = load_dataset('glue', self.task_name)
 
@@ -176,8 +176,8 @@ class GLUEEvaluator():
 
         self.data_loaders = dict()
         self.data_loaders['train'] = datasets["train"]
-        if test:
-            self.data_loaders['test'] = datasets["test_matched" if self.task_name == "mnli" else "test"]
+
+        # self.data_loaders['test'] = datasets["test_matched" if self.task_name == "mnli" else "test"]
 
         if self.task_name == "mnli":
             self.data_loaders['validation_matched'] = datasets["validation_matched"]
@@ -196,7 +196,8 @@ class GLUEEvaluator():
 
         for step, batch in enumerate(train_dataloader):
             # move batch to gpu
-            batch = tuple(obj.cuda(self.device) for obj in batch)
+            if self.device is not None:
+                batch = tuple(obj.cuda(self.device) for obj in batch)
             if 'roberta' in self.model_name:
                 input_ids, attention_mask, labels = batch
                 token_type_ids = None
@@ -242,7 +243,8 @@ class GLUEEvaluator():
 
         for step, batch in enumerate(dataloader):
             # move batch to gpu
-            batch = tuple(obj.cuda(self.device) for obj in batch)
+            if self.device is not None:
+                batch = tuple(obj.cuda(self.device) for obj in batch)
             if 'roberta' in self.model_name:
                 input_ids, attention_mask, labels = batch
                 token_type_ids = None
@@ -303,8 +305,7 @@ class GLUEEvaluator():
         self.encoder_trainable = encoder_trainable
         # model declaration
         config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config).cuda(
-            self.device)
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
         self._deactivate_relevant_gradients(encoder_trainable, trainable_components)
 
         # optimizer declaration
@@ -330,24 +331,25 @@ class GLUEEvaluator():
         self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
                             self.data_loaders.keys()}
 
-    def plot_evaluations(self):
+    def plot_evaluations(self, output_path):
         for metric_name in TASK_TO_METRICS[self.task_name]:
             for dataloader_type, results_mapper in self.evaluations.items():
                 label = f'{dataloader_type}_{round(max(results_mapper[metric_name]) * 100, 2)}'
                 plt.plot(results_mapper[metric_name], label=label)
             plt.title(metric_name)
             plt.legend()
-            plt.show()
+            if output_path:
+                plt.savefig(os.path.join(output_path, 'metric_name'))
+            else:
+                plt.show()
 
-    def _plot_summary(self):
-        print(f'Task: {self.task_name}\nModel: {self.model_name}\nETA: {self.learning_rate}\nDevice: {self.device}')
-
-    def train_and_evaluate(self, num_epochs):
+    def train_and_evaluate(self, num_epochs, output_path):
         if not self.data_loaders:
             raise Exception('data loaders does not exist, please run "preprocess_dataset" before training.')
 
-        self.model.cuda(self.device)
-        self._plot_summary()
+        if self.device is not None:
+            self.model.cuda(self.device)
+
         for epoch in range(num_epochs):
             # Training
             self._train(self.data_loaders['train'], epoch)
@@ -359,7 +361,7 @@ class GLUEEvaluator():
                     self.evaluations[dataloader_type][metric_name].append(result)
 
             # Plotting
-            self.plot_evaluations()
+            self.plot_evaluations(output_path)
 
     def plot_terms_changes(self, save_to=None):
         base_model = AutoModelForSequenceClassification.from_pretrained(self.model_name, return_dict=True)
@@ -426,6 +428,8 @@ class GLUEEvaluator():
 
         if save_to:
             plt.savefig(save_to)
+        else:
+            plt.show()
 
     def save(self, path=None):
         fine_tuned = 'full_FT' if self.encoder_trainable else 'bitfit'
