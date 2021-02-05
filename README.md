@@ -36,7 +36,7 @@ For further information about the arguments run:
 python run_glue.py -h
 ```
 
-Example of running BitFit with all bias terms:
+Example of running full BitFit (traing all bias terms):
 ```
 python run_glue.py --task-name rte\
        --output-path <output_path>\
