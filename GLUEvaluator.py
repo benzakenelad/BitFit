@@ -1,6 +1,9 @@
+"""BitFit evaluation on GLUE Benchmark. Link to paper: TODO"""
+
 import re
 from functools import reduce
 import os
+import logging
 
 import torch
 import numpy as np
@@ -14,6 +17,10 @@ from transformers.optimization import AdamW
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from torch.optim import Adam
 from datasets import load_dataset
+
+
+LOGGER = logging.getLogger(__file__)
+
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -103,7 +110,20 @@ BIAS_LAYER_NAME_TO_LATEX = {
 }
 
 
-class GLUEEvaluator:
+class GLUEvaluator:
+    """This class contains the functionality for BitFit evaluation on GLUE benchmark.
+
+    If the class has public attributes, they may be documented here
+    in an ``Attributes`` section and follow the same formatting as a
+    function's ``Args`` section. Alternatively, attributes may be documented
+    inline with the attribute's declaration (see __init__ method below).
+
+    Attributes:
+        attr1 (str): Description of `attr1`.
+        attr2 (:obj:`int`, optional): Description of `attr2`.
+
+    """
+
     def __init__(self, task_name, model_name, device):
         self.task_name = task_name
         self.model_name = model_name
@@ -167,7 +187,7 @@ class GLUEEvaluator:
             batch_size (int): training and evaluating batch size
 
         """
-        print(f'Downloading dataset: {self.task_name}')
+        LOGGER.info(f'Downloading dataset: {self.task_name}')
         datasets = load_dataset('glue', self.task_name)
 
         self.batch_size = batch_size
@@ -259,8 +279,9 @@ class GLUEEvaluator:
             self.optimizer.step()
             self.model.zero_grad()
 
-            print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r', end='')
-        print('')
+            LOGGER.info(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r',
+                        end='')
+        LOGGER.info('')
 
     def _evaluate(self, dataloader, dataloader_type):
         # evaluate model on validation set
@@ -296,15 +317,12 @@ class GLUEEvaluator:
                 outputs = np.argmax(outputs, axis=1)
                 # accuracy calculation
                 accuracy_sum += accuracy_score(labels, outputs) * len(labels)
-                print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+                LOGGER.info(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
             all_preds.extend(list(outputs))
             all_labels.extend(list(labels))
 
-            if step * self.batch_size > 40000:
-                break
-
-        print('')
+        LOGGER.info('')
         results = {}
         for metric_name in TASK_TO_METRICS[self.task_name]:
             metric = METRIC_NAME_TO_FUNCTION[metric_name]
@@ -315,10 +333,10 @@ class GLUEEvaluator:
         return results
 
     def _deactivate_relevant_gradients(self, encoder_trainable, trainable_components):
+        # turn off the model parameters requires_grad except the trainable bias terms.
         if not encoder_trainable:
             for param in self.model.parameters():
                 param.requires_grad = False
-            assert len(trainable_components) > 0
             trainable_components = trainable_components + ['pooler.dense.bias', 'classifier']
             for name, param in self.model.named_parameters():
                 for component in trainable_components:
@@ -360,37 +378,17 @@ class GLUEEvaluator:
         self.learning_rate = learning_rate
 
         if verbose:
-            print('Trainable Components:\n----------------------------------------\n')
+            LOGGER.info('Trainable Components:\n----------------------------------------\n')
             total_trainable_params = 0
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    print(name, '  --->  ', param.shape)
+                    LOGGER.info(name, '  --->  ', param.shape)
                     total_trainable_params += param.shape[0] if len(param.shape) == 1 else param.shape[0] * param.shape[
                         1]
-            print(f'\n----------------------------------------\nTrainable Parameters: {total_trainable_params}')
+            LOGGER.info(f'\n----------------------------------------\nTrainable Parameters: {total_trainable_params}')
 
         self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
                             self.data_loaders.keys()}
-
-    def plot_evaluations(self, output_path):
-        """Plot the learning curves for each metric.
-
-        Args:
-            output_path (str): Directory path to save the learning curves too, if None will print the figure.
-
-        """
-        for metric_name in TASK_TO_METRICS[self.task_name]:
-            for dataloader_type, results_mapper in self.evaluations.items():
-                if not ('test' in dataloader_type):
-                    label = f'{dataloader_type}_{round(max(results_mapper[metric_name]) * 100, 2)}'
-                    plt.plot(results_mapper[metric_name], label=label)
-            plt.title(metric_name)
-            plt.legend()
-            if output_path:
-                plt.savefig(os.path.join(output_path, f'learning_curves_{metric_name.lower()}'))
-                plt.clf()
-            else:
-                plt.show()
 
     def train_and_evaluate(self, num_epochs, output_path):
         """Trains the encoder model and evaluate it on validation set.
@@ -421,10 +419,30 @@ class GLUEEvaluator:
                     results = self._evaluate(dataloader, dataloader_type.upper())
                     for metric_name, result in results.items():
                         self.evaluations[dataloader_type][metric_name].append(result)
-            print('')
+            LOGGER.info('')
 
             # Plotting
             self.plot_evaluations(output_path)
+
+    def plot_evaluations(self, output_path):
+        """Plot the learning curves for each metric.
+
+        Args:
+            output_path (str): Directory path to save the learning curves too, if None will print the figure.
+
+        """
+        for metric_name in TASK_TO_METRICS[self.task_name]:
+            for dataloader_type, results_mapper in self.evaluations.items():
+                if not ('test' in dataloader_type):
+                    label = f'{dataloader_type}_{round(max(results_mapper[metric_name]) * 100, 2)}'
+                    plt.plot(results_mapper[metric_name], label=label)
+            plt.title(metric_name)
+            plt.legend()
+            if output_path:
+                plt.savefig(os.path.join(output_path, f'learning_curves_{metric_name.lower()}'))
+                plt.clf()
+            else:
+                plt.show()
 
     def plot_terms_changes(self, output_path=None):
         """Plot/save the terms changes (calculating explained below).
@@ -513,22 +531,23 @@ class GLUEEvaluator:
             output_path (str): Directory to save to model to.
 
         """
-        fine_tuned = 'full_FT' if self.encoder_trainable else 'bitfit'
-        output_path = output_path if output_path else ''
 
-        name = f'{self.model_name}__{fine_tuned}__{self.task_name}__'
-        for dataset_name, metrics in self.evaluations.items():
-            name += f'{dataset_name}_'
-            for metric_name, scores in metrics.items():
-                name += f'{metric_name}_{round(max(scores), 3)}_'
-            name += '_'
+        if not output_path:
+            fine_tuned = 'full_FT' if self.encoder_trainable else 'bitfit'
+            output_path = f'{self.model_name}__{fine_tuned}__{self.task_name}__'
+            for dataset_name, metrics in self.evaluations.items():
+                if not ('test' in dataset_name):
+                    output_path += f'{dataset_name}_'
+                    for metric_name, scores in metrics.items():
+                        output_path += f'{metric_name}_{round(max(scores), 3)}_'
+                    output_path += '_'
 
         self.model.cpu()
         data = {'model': self.model, 'model_name': self.model_name, 'task_name': self.task_name,
                 'learning_rate': self.learning_rate, 'evaluations': self.evaluations,
                 'batch_size': self.batch_size, 'num_labels': self.num_labels,
                 'encoder_trainable': self.encoder_trainable}
-        with open(os.path.join(output_path, name), 'wb') as file:
+        with open(output_path, 'wb') as file:
             pickle.dump(data, file)
 
     @staticmethod
@@ -542,7 +561,7 @@ class GLUEEvaluator:
         """
         with open(path, 'rb') as file:
             data = pickle.load(file)
-        evaluator = GLUEEvaluator(data['task_name'], data['model_name'], gpu_device)
+        evaluator = GLUEvaluator(data['task_name'], data['model_name'], gpu_device)
         evaluator.num_labels = data['num_labels']
         evaluator.batch_size = data['batch_size']
         evaluator.model = data['model']
@@ -575,8 +594,8 @@ class GLUEEvaluator:
         tunable_params_per_component = {k: int((v * mask_size) / total_params) for k, v in
                                         params_per_component.items()}
 
-        print(f'Mask size: {reduce(lambda x, y: x + y, tunable_params_per_component.values())}. '
-              f'Total params: {total_params}')
+        LOGGER.info(f'Mask size: {reduce(lambda x, y: x + y, tunable_params_per_component.values())}. '
+                    f'Total params: {total_params}')
 
         for name, param in self.model.bert.named_parameters():
             component_mask_size = tunable_params_per_component[name]
@@ -602,6 +621,9 @@ class GLUEEvaluator:
 
         if not self.model:
             raise Exception('model was not initialized, please run "training_preparation" before test evaluation.')
+
+        if self.device is not None:
+            self.model.cuda(self.device)
 
         test_data_loaders = dict()
         if self.task_name == 'mnli':
@@ -640,11 +662,11 @@ class GLUEEvaluator:
                         results.extend([self.idx_to_label[pred] for pred in outputs])
 
                 counter += len(outputs)
-                print(f'Test inference progress: {counter}/{num_samples}\r', end='')
-            print('')
+                LOGGER.info(f'Test inference progress: {counter}/{num_samples}\r', end='')
+            LOGGER.info('')
             with open(os.path.join(output_path, prediction_file_name), 'w') as file:
                 file.write('index\tprediction\n')
                 for idx, result in enumerate(results):
                     file.write(f'{idx}\t{result}\n')
 
-        print(f'Test evaluation is over, evaluation artifacts are: {list(test_data_loaders.keys())}')
+        LOGGER.info(f'Test evaluation is over, evaluation artifacts are: {list(test_data_loaders.keys())}')

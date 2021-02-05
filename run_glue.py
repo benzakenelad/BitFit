@@ -1,6 +1,13 @@
 import argparse
 import os
-from GLUEEvaluator import GLUEEvaluator
+import logging
+from utils import setup_logging
+from GLUEvaluator import GLUEvaluator
+
+
+setup_logging()
+LOGGER = logging.getLogger(__file__)
+
 
 PADDING = "max_length"
 MAX_SEQUENCE_LEN = 128
@@ -28,9 +35,9 @@ def parse_args():
     parser.add_argument('--epochs', '-e', type=int, default=16, help='number of training epochs.')
     parser.add_argument('--batch-size', '-b', type=int, default=8, help='training and evaluation batch size.')
     parser.add_argument('--optimizer', type=str, default='adamw', choices={'adam', 'adamw'})
-    parser.add_argument('--save_evaluator', action='store_true', default=False,
+    parser.add_argument('--save-evaluator', action='store_true', default=False,
                         help='if given, will save the evaluator for later inference/examination.')
-    parser.add_argument('--predict_test', action='store_true', default=False,
+    parser.add_argument('--predict-test', action='store_true', default=False,
                         help='if given, will infer on test set using the fine-tuned model (predictions file will be in '
                              'GLUE benchmark test server format). Predictions will be saved to output_path.')
 
@@ -44,16 +51,47 @@ def validate_args(args):
         raise ValueError('--output_path directory isn\'t empty, please supply an empty directory path.')
 
 
+def plot_training_details(args):
+    [LOGGER.info('############################################################################################') for _ in range(3)]
+    LOGGER.info('')
+
+    LOGGER.info('Training Details: ')
+    LOGGER.info('----------------------------------------------')
+    LOGGER.info(f'Model Name: {args.model_name}')
+    LOGGER.info(f'Task Name: {args.task_name}')
+    LOGGER.info(f'Output Directory: {args.output_path}')
+
+    if args.gpu_device is not None:
+        LOGGER.info(f'Running on GPU #{args.gpu_device}')
+    else:
+        LOGGER.info(f'Running on CPU')
+
+    if args.full_ft:
+        LOGGER.info('Performing full (standard) fine-tuning')
+    else:
+        LOGGER.info(f'Bias Trainable Terms: {args.bias_terms}')
+
+    LOGGER.info(f'Epochs: {args.epochs}')
+    LOGGER.info(f'Learning Rate: {args.learning_rate}')
+    LOGGER.info(f'Batch Size: {args.batch_size}')
+    LOGGER.info(f"Optimizer: {'AdamW' if args.optimizer == 'adamw' else 'Adam'}")
+
+    LOGGER.info('')
+    [LOGGER.info('############################################################################################') for _ in range(3)]
+
+
 def main():
+
     # args parsing
     args = parse_args()
     validate_args(args)
+    plot_training_details(args)
 
     # evaluator creation
-    evaluator = GLUEEvaluator(args.task_name, args.model_name, args.gpu_device)
+    evaluator = GLUEvaluator(args.task_name, args.model_name, args.gpu_device)
 
     # data preprocessing
-    trainable_components = GLUEEvaluator.convert_to_actual_components(args.bias_terms)
+    trainable_components = GLUEvaluator.convert_to_actual_components(args.bias_terms)
     evaluator.preprocess_dataset(PADDING, MAX_SEQUENCE_LEN, args.batch_size)
 
     # training preparation
@@ -68,7 +106,7 @@ def main():
 
     # save model
     if args.save_evaluator:
-        evaluator.save(args.output_path)
+        evaluator.save(os.path.join(args.output_path, 'evaluator'))
 
     # export model test set predictions
     if args.predict_test:
