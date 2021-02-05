@@ -58,6 +58,5 @@ def main():
     evaluator.plot_terms_changes(save_to=os.path.join(args.output_path, 'bias_term_changes'))
 
 
-
 if __name__ == '__main__':
     main()

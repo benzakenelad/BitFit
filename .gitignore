@@ -2,3 +2,4 @@
 *.cache*
 *.ipynb_checkpoints*
 *__pycache__*
+test
