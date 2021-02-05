@@ -241,6 +241,7 @@ class GLUEvaluator:
             # move batch to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
+
             if 'roberta' in self.model_name:
                 input_ids, attention_mask, labels = batch
                 token_type_ids = None
