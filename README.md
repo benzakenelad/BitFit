@@ -21,13 +21,24 @@ $ conda activate bitfit_env
 python run_glue.py --task-name <task_name>\
        --output-path <output_path>\
        --model-name <model_name>\
+       --full-ft\
        --bias-terms <bias_terms>\
        --gpu-device <gpu_device>\
        --learning-rate <learning_rate>\
        --epochs <epochs>\
-       --batch-size <batch_size>
+       --batch-size <batch_size>\
+       --optimizer <optimizer_name>\
+       --save-evaluator\
+       --predict-test
 ```
-For further information about the arguments please run:
+For further information about the arguments run:
 ```
 python run_glue.py -h
+```
+
+Example of running BitFit with all bias terms:
+```
+python run_glue.py --task-name rte\
+       --output-path <output_path>\
+       --model-name bert-base-cased
 ```
