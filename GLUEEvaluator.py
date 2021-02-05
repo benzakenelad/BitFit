@@ -103,7 +103,7 @@ BIAS_LAYER_NAME_TO_LATEX = {
 }
 
 
-class GLUEEvaluator():
+class GLUEEvaluator:
     def __init__(self, task_name, model_name, device):
         self.task_name = task_name
         self.model_name = model_name
@@ -120,9 +120,20 @@ class GLUEEvaluator():
         self.evaluations = None
         self.encoder_trainable = None
         self.masks = None
+        self.idx_to_label = None
 
     @staticmethod
-    def convert_to_data_loader(dataset, model_name, batch_size, random, test=False):
+    def convert_dataset_to_data_loader(dataset, model_name, batch_size, random_sampler, test=False):
+        """Convert a Dataset to torch DataLoader.
+
+        Args:
+            dataset (datasets.arrow_dataset.Dataset): the dataset to convert to torch DataLoader.
+            model_name (str): model name (e.g. bert-base-uncased).
+            batch_size (int): batch size for training and evaluation.
+            random_sampler (bool): if True, DataLoader will sample randomly else sequentially.
+            test (bool): if True, dataset contains test samples.
+
+        """
         if test:
             keys = ['input_ids', 'attention_mask', 'token_type_ids']
         else:
@@ -140,7 +151,7 @@ class GLUEEvaluator():
             data[k] = torch.tensor(v)
 
         tensor_dataset = TensorDataset(*[data[key] for key in keys])
-        data_sampler = RandomSampler(tensor_dataset) if random else SequentialSampler(tensor_dataset)
+        data_sampler = RandomSampler(tensor_dataset) if random_sampler else SequentialSampler(tensor_dataset)
         return DataLoader(tensor_dataset, sampler=data_sampler, batch_size=batch_size)
 
     @staticmethod
@@ -148,6 +159,14 @@ class GLUEEvaluator():
         return [BIAS_TERMS_DICT[component] for component in components]
 
     def preprocess_dataset(self, padding, max_sequence_len, batch_size):
+        """Preprocess the train and validation datasets.
+
+        Args:
+            padding (str): padding method (currently 'max_length' is the suggested method)
+            max_sequence_len (int): the maximum sequence length.
+            batch_size (int): training and evaluating batch size
+
+        """
         print(f'Downloading dataset: {self.task_name}')
         datasets = load_dataset('glue', self.task_name)
 
@@ -157,6 +176,7 @@ class GLUEEvaluator():
         is_regression = self.task_name == "stsb"
         if not is_regression:
             label_list = datasets["train"].features["label"].names
+            self.idx_to_label = {k: v for k, v in enumerate(datasets['train'].features['label'].__dict__['_int2str'])}
             self.num_labels = len(label_list)
         else:
             self.num_labels = 1
@@ -175,20 +195,26 @@ class GLUEEvaluator():
         datasets = datasets.map(_preprocess_function, batched=True, load_from_cache_file=False)
 
         self.data_loaders = dict()
-        self.data_loaders['train'] = datasets["train"]
+        self.data_loaders['train'] = datasets['train']
 
-        # self.data_loaders['test'] = datasets["test_matched" if self.task_name == "mnli" else "test"]
-
-        if self.task_name == "mnli":
-            self.data_loaders['validation_matched'] = datasets["validation_matched"]
-            self.data_loaders['validation_mismatched'] = datasets["validation_mismatched"]
+        if self.task_name == 'mnli':
+            self.data_loaders['validation_matched'] = datasets['validation_matched']
+            self.data_loaders['validation_mismatched'] = datasets['validation_mismatched']
+            self.data_loaders['test_matched'] = datasets['test_matched']
+            self.data_loaders['test_mismatched'] = datasets['test_mismatched']
         else:
-            self.data_loaders['validation'] = datasets["validation"]
+            self.data_loaders['validation'] = datasets['validation']
+            self.data_loaders['test'] = datasets['test']
 
-        for k, dataset in self.data_loaders.items():
-            self.data_loaders[k] = self.convert_to_data_loader(dataset, self.model_name, self.batch_size, k == 'train')
+        for dataset_name, dataset in self.data_loaders.items():
+            self.data_loaders[dataset_name] = self.convert_dataset_to_data_loader(dataset=dataset,
+                                                                                  model_name=self.model_name,
+                                                                                  batch_size=self.batch_size,
+                                                                                  random_sampler=dataset_name == 'train',
+                                                                                  test='test' in dataset_name)
 
     def _train(self, train_dataloader, epoch, max_grad_norm=1.0):
+        # train the model
         self.model.train()
         trained_samples, loss_sum = 0, 0
         criteria = torch.nn.MSELoss() if self.is_regression else torch.nn.CrossEntropyLoss()
@@ -234,9 +260,10 @@ class GLUEEvaluator():
             self.model.zero_grad()
 
             print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r', end='')
-        print('\n')
+        print('')
 
     def _evaluate(self, dataloader, dataloader_type):
+        # evaluate model on validation set
         self.model.eval()
         evaluated_samples, accuracy_sum = 0, 0
         all_preds, all_labels = [], []
@@ -277,6 +304,7 @@ class GLUEEvaluator():
             if step * self.batch_size > 40000:
                 break
 
+        print('')
         results = {}
         for metric_name in TASK_TO_METRICS[self.task_name]:
             metric = METRIC_NAME_TO_FUNCTION[metric_name]
@@ -299,6 +327,19 @@ class GLUEEvaluator():
                         break
 
     def training_preparation(self, learning_rate, encoder_trainable, trainable_components, optimizer, verbose=True):
+        """Perform training preparation including: model initialization, optimizer definition,
+
+        Perform training preparation including: model initialization, optimizer initialization, relevant
+        gradients deactivation and plotting a list of all trainable params.
+
+        Args:
+            learning_rate (float): learning_rate to train with.
+            encoder_trainable (bool): if True will perform a Full-FT else will perform BitFit training preparation.
+            trainable_components(list[str]): list of trainable component. (subset of `BIAS_TERMS_DICT` keys)
+            optimizer(str): optimizer to perform the training with, currently adam and adamw are supported.
+            verbose: if True will plot a list of all trainable params
+
+        """
         if self.model:
             raise Exception('Training preparation was already completed.')
 
@@ -332,20 +373,40 @@ class GLUEEvaluator():
                             self.data_loaders.keys()}
 
     def plot_evaluations(self, output_path):
+        """Plot the learning curves for each metric.
+
+        Args:
+            output_path (str): Directory path to save the learning curves too, if None will print the figure.
+
+        """
         for metric_name in TASK_TO_METRICS[self.task_name]:
             for dataloader_type, results_mapper in self.evaluations.items():
-                label = f'{dataloader_type}_{round(max(results_mapper[metric_name]) * 100, 2)}'
-                plt.plot(results_mapper[metric_name], label=label)
+                if not ('test' in dataloader_type):
+                    label = f'{dataloader_type}_{round(max(results_mapper[metric_name]) * 100, 2)}'
+                    plt.plot(results_mapper[metric_name], label=label)
             plt.title(metric_name)
             plt.legend()
             if output_path:
-                plt.savefig(os.path.join(output_path, 'metric_name'))
+                plt.savefig(os.path.join(output_path, f'learning_curves_{metric_name.lower()}'))
+                plt.clf()
             else:
                 plt.show()
 
     def train_and_evaluate(self, num_epochs, output_path):
+        """Trains the encoder model and evaluate it on validation set.
+
+        Learning curves will be saved to the output_path.
+
+        Args:
+            num_epochs (int): Number of epochs to perform.
+            output_path (str): Directory path to save the learning curves too.
+
+        """
         if not self.data_loaders:
-            raise Exception('data loaders does not exist, please run "preprocess_dataset" before training.')
+            raise Exception('data loaders were not initialized, please run "preprocess_dataset" before training.')
+
+        if not self.model:
+            raise Exception('model was not initialized, please run "training_preparation" before training.')
 
         if self.device is not None:
             self.model.cuda(self.device)
@@ -356,14 +417,25 @@ class GLUEEvaluator():
 
             # Evaluation
             for dataloader_type, dataloader in self.data_loaders.items():
-                results = self._evaluate(dataloader, dataloader_type.upper())
-                for metric_name, result in results.items():
-                    self.evaluations[dataloader_type][metric_name].append(result)
+                if not ('test' in dataloader_type):
+                    results = self._evaluate(dataloader, dataloader_type.upper())
+                    for metric_name, result in results.items():
+                        self.evaluations[dataloader_type][metric_name].append(result)
+            print('')
 
             # Plotting
             self.plot_evaluations(output_path)
 
-    def plot_terms_changes(self, save_to=None):
+    def plot_terms_changes(self, output_path=None):
+        """Plot/save the terms changes (calculating explained below).
+
+        We define the amount of change in a bias vector b to be (1/dim(b)) * |b_0 - b_f|_1 that is, the average
+        absolute change, across its dimensions, between the initial LM values b_0 and its fine-tuned values b_f.
+
+        Args:
+            output_path (str): Directory path to save the terms changes heatmap too, if None will print the figure.
+
+        """
         base_model = AutoModelForSequenceClassification.from_pretrained(self.model_name, return_dict=True)
         fine_tuned_model = self.model.cpu()
         num_layers = self.model.config.num_hidden_layers
@@ -415,8 +487,7 @@ class GLUEEvaluator():
         xticklabels.append('Avg.')
 
         keys = [BIAS_LAYER_NAME_TO_LATEX[key] for key in keys]
-        heatmap(values_map, cmap="BuPu", ax=ax, linecolor='white', linewidth=0.2, yticklabels=keys,
-                xticklabels=xticklabels)
+        heatmap(values_map, cmap="Blues", ax=ax, yticklabels=keys, xticklabels=xticklabels)
 
         plt.xticks(rotation=45)
         plt.yticks(rotation=0, ha='left')
@@ -426,46 +497,70 @@ class GLUEEvaluator():
         pad = max(T.label.get_window_extent().width for T in yax.majorTicks)
         yax.set_tick_params(pad=pad)
 
-        if save_to:
-            plt.savefig(save_to)
+        if output_path:
+            plt.savefig(output_path)
+            plt.clf()
         else:
             plt.show()
 
-    def save(self, path=None):
-        fine_tuned = 'full_FT' if self.encoder_trainable else 'bitfit'
+        if self.device is not None:
+            self.model.cuda(self.device)
 
-        if not path:
-            path = f'{self.model_name}__{fine_tuned}__{self.task_name}__'
-            for dataset_name, metrics in self.evaluations.items():
-                path += f'{dataset_name}_'
-                for metric_name, scores in metrics.items():
-                    path += f'{metric_name}_{round(max(scores), 3)}_'
-                path += '_'
+    def save(self, output_path=None):
+        """Saves the evaluator to the output_path.
+
+        Args:
+            output_path (str): Directory to save to model to.
+
+        """
+        fine_tuned = 'full_FT' if self.encoder_trainable else 'bitfit'
+        output_path = output_path if output_path else ''
+
+        name = f'{self.model_name}__{fine_tuned}__{self.task_name}__'
+        for dataset_name, metrics in self.evaluations.items():
+            name += f'{dataset_name}_'
+            for metric_name, scores in metrics.items():
+                name += f'{metric_name}_{round(max(scores), 3)}_'
+            name += '_'
 
         self.model.cpu()
         data = {'model': self.model, 'model_name': self.model_name, 'task_name': self.task_name,
                 'learning_rate': self.learning_rate, 'evaluations': self.evaluations,
                 'batch_size': self.batch_size, 'num_labels': self.num_labels,
                 'encoder_trainable': self.encoder_trainable}
-        with open(path, 'wb') as file:
+        with open(os.path.join(output_path, name), 'wb') as file:
             pickle.dump(data, file)
 
     @staticmethod
-    def load(path, device):
+    def load(path, gpu_device):
+        """Loads the evaluator from `path`.
+
+        Args:
+            gpu_device (int): GPU device ID.
+            path (str): Directory to load to model from.
+
+        """
         with open(path, 'rb') as file:
             data = pickle.load(file)
-        evaluator = GLUEEvaluator(data['task_name'], data['model_name'], device)
+        evaluator = GLUEEvaluator(data['task_name'], data['model_name'], gpu_device)
         evaluator.num_labels = data['num_labels']
         evaluator.batch_size = data['batch_size']
-        evaluator.model = data['model'].cuda(device)
+        evaluator.model = data['model']
         evaluator.learning_rate = data['learning_rate']
         evaluator.evaluations = data['evaluations']
         evaluator.encoder_trainable = data.get('encoder_trainable', None)
-        evaluator.device = device
 
         return evaluator
 
     def randomize_mask(self, mask_size=100000):
+        """Randomly choose `mask_size` parameters from the model and generating a boolean mask for every component.
+
+        Randomly sample `mask_size` parameters as in BitFit from the entire model, and fine-tuned only them.
+
+        Args:
+            mask_size (int): number of trainable parameters.
+
+        """
         if not self.encoder_trainable:
             raise Exception('In order to train with random mask the encoder must be trainable.')
 
@@ -494,82 +589,62 @@ class GLUEEvaluator():
                 else:
                     mask[int(index / param.shape[1]), index % param.shape[1]] = True
 
+    def export_model_test_set_predictions(self, output_path):
+        """Infers on test set and saves the predictions to output_path (predictions are in GLUE test server format).
 
-def evaluate_test(model, model_name, task_name, device, old_version, batch_size=16, padding='max_length',
-                  max_sequence_len=128):
-    assert 'bert' in model_name and 'roberta' not in model_name
-    print(f'Downloading dataset: {task_name}')
-    datasets = load_dataset('glue', task_name)
+        Args:
+            output_path (str): Directory to save the predictions.
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+        """
+        if not self.data_loaders:
+            raise Exception(
+                'data loaders were not initialized, please run "preprocess_dataset" before test evaluation.')
 
-    is_regression = task_name == "stsb"
-    if not is_regression:
-        label_list = datasets["train"].features["label"].names
-        idx_to_label = {k: v for k, v in enumerate(datasets['train'].features['label'].__dict__['_int2str'])}
-        num_labels = len(label_list)
-    else:
-        num_labels = 1
+        if not self.model:
+            raise Exception('model was not initialized, please run "training_preparation" before test evaluation.')
 
-    sentence1_key, sentence2_key = TASK_TO_KEYS[task_name]
+        test_data_loaders = dict()
+        if self.task_name == 'mnli':
+            test_data_loaders["MNLI-m.tsv"] = self.data_loaders["test_matched"]
+            test_data_loaders["MNLI-mm.tsv"] = self.data_loaders["test_mismatched"]
+        else:
+            test_data_loaders[TASK_NAME_TO_SUBMISSION_FILE_NAME[self.task_name]] = self.data_loaders["test"]
 
-    def _preprocess_function(examples):
-        # Tokenize the texts
-        args = (
-            (examples[sentence1_key],) if sentence2_key is None else (
-                examples[sentence1_key], examples[sentence2_key])
-        )
-        result = tokenizer(*args, padding=padding, max_length=max_sequence_len, truncation=True)
-        return result
+        self.model.eval()
 
-    datasets = datasets.map(_preprocess_function, batched=True, load_from_cache_file=False)
+        for prediction_file_name, dataloader in test_data_loaders.items():
+            results = list()
+            counter = 0
+            num_samples = len(dataloader.dataset)
+            for batch in dataloader:
+                if self.device is not None:
+                    batch = tuple(obj.cuda(self.device) for obj in batch)
+                input_ids, attention_mask, token_type_ids = batch
 
-    test_data_loaders = dict()
-    if task_name == 'mnli':
-        test_data_loaders["MNLI-m.tsv"] = datasets["test_matched"]
-        test_data_loaders["MNLI-mm.tsv"] = datasets["test_mismatched"]
-    else:
-        test_data_loaders[TASK_NAME_TO_SUBMISSION_FILE_NAME[task_name]] = datasets["test"]
-
-    for k, dataloader in test_data_loaders.items():
-        test_data_loaders[k] = GLUEEvaluator.convert_to_data_loader(dataloader, model_name, batch_size, random=False,
-                                                                    test=True)
-
-    model.eval()
-
-    for file_name, dataloader in test_data_loaders.items():
-        results = []
-        counter = 0
-        num_samples = len(dataloader.dataset)
-        for batch in dataloader:
-            batch = tuple(obj.cuda(device) for obj in batch)
-            input_ids, attention_mask, token_type_ids = batch
-
-            with torch.no_grad():
-                if old_version:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
-                                    src_key_padding_mask=None)
-                else:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                with torch.no_grad():
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                         token_type_ids=token_type_ids)
                     outputs = outputs.logits
 
-            if is_regression:
-                outputs = outputs.view(-1)
-                outputs = outputs.detach().cpu().numpy()
-                results.extend(list(outputs))
-            else:
-                outputs = outputs.view(-1, num_labels)
-                outputs = outputs.detach().cpu().numpy()
-                outputs = np.argmax(outputs, axis=-1)
-                if TASK_IS_BINARY[task_name]:
-                    results.extend([int(pred) for pred in outputs])
+                if self.is_regression:
+                    outputs = outputs.view(-1)
+                    outputs = outputs.detach().cpu().numpy()
+                    results.extend(list(outputs))
                 else:
-                    results.extend([idx_to_label[pred] for pred in outputs])
+                    outputs = outputs.view(-1, self.num_labels)
+                    outputs = outputs.detach().cpu().numpy()
+                    outputs = np.argmax(outputs, axis=-1)
+                    if TASK_IS_BINARY[self.task_name]:
+                        results.extend([int(pred) for pred in outputs])
+                    else:
+                        results.extend([self.idx_to_label[pred] for pred in outputs])
 
-            counter += len(outputs)
-            print(f'{counter}/{num_samples}\r', end='')
+                counter += len(outputs)
+                print(f'Test inference progress: {counter}/{num_samples}\r', end='')
+            print('')
+            with open(os.path.join(output_path, prediction_file_name), 'w') as file:
+                file.write('index\tprediction\n')
+                for idx, result in enumerate(results):
+                    file.write(f'{idx}\t{result}\n')
 
-        with open(file_name, 'w') as file:
-            file.write('index\tprediction\n')
-            for idx, result in enumerate(results):
-                file.write(f'{idx}\t{result}\n')
+        print(f'Test evaluation is over, evaluation artifacts are: {list(test_data_loaders.keys())}')
