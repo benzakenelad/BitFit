@@ -112,14 +112,12 @@ BIAS_LAYER_NAME_TO_LATEX = {
 class GLUEvaluator:
     """This class contains the functionality for BitFit evaluation on GLUE benchmark.
 
-    If the class has public attributes, they may be documented here
-    in an ``Attributes`` section and follow the same formatting as a
-    function's ``Args`` section. Alternatively, attributes may be documented
-    inline with the attribute's declaration (see __init__ method below).
+    This class expose an API for evaluating BitFit on GLUE Benchmark (https://arxiv.org/abs/1804.07461).
 
     Attributes:
-        attr1 (str): Description of `attr1`.
-        attr2 (:obj:`int`, optional): Description of `attr2`.
+        task_name (str): task name, e.g. 'rte'.
+        model_name (str): model name, e.g. 'bert-base-uncased'.
+        device (str): GPU device to run on, if None will run on CPU.
 
     """
 
