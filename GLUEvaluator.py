@@ -277,9 +277,8 @@ class GLUEvaluator:
             self.optimizer.step()
             self.model.zero_grad()
 
-            LOGGER.info(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r',
-                        end='')
-        LOGGER.info('')
+            print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r',end='')
+        print('')
 
     def _evaluate(self, dataloader, dataloader_type):
         # evaluate model on validation set
@@ -315,12 +314,12 @@ class GLUEvaluator:
                 outputs = np.argmax(outputs, axis=1)
                 # accuracy calculation
                 accuracy_sum += accuracy_score(labels, outputs) * len(labels)
-                LOGGER.info(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+                print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
             all_preds.extend(list(outputs))
             all_labels.extend(list(labels))
 
-        LOGGER.info('')
+        print('')
         results = {}
         for metric_name in TASK_TO_METRICS[self.task_name]:
             metric = METRIC_NAME_TO_FUNCTION[metric_name]
@@ -417,7 +416,7 @@ class GLUEvaluator:
                     results = self._evaluate(dataloader, dataloader_type.upper())
                     for metric_name, result in results.items():
                         self.evaluations[dataloader_type][metric_name].append(result)
-            LOGGER.info('')
+            print('')
 
             # Plotting
             self.plot_evaluations(output_path)
@@ -660,8 +659,8 @@ class GLUEvaluator:
                         results.extend([self.idx_to_label[pred] for pred in outputs])
 
                 counter += len(outputs)
-                LOGGER.info(f'Test inference progress: {counter}/{num_samples}\r', end='')
-            LOGGER.info('')
+                print(f'Test inference progress: {counter}/{num_samples}\r', end='')
+            print('')
             with open(os.path.join(output_path, prediction_file_name), 'w') as file:
                 file.write('index\tprediction\n')
                 for idx, result in enumerate(results):

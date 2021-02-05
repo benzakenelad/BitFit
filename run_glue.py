@@ -69,7 +69,7 @@ def plot_training_details(args):
     if args.full_ft:
         LOGGER.info('Performing full (standard) fine-tuning')
     else:
-        LOGGER.info(f'Bias Trainable Terms: {args.bias_terms}')
+        LOGGER.info(f"Bias Trainable Terms: {'all bias terms' if 'all' in args.bias_terms else args.bias_terms}")
 
     LOGGER.info(f'Epochs: {args.epochs}')
     LOGGER.info(f'Learning Rate: {args.learning_rate}')
