@@ -16,10 +16,9 @@ from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-
+from datasets.arrow_dataset import Dataset
 
 LOGGER = logging.getLogger(__file__)
-
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -175,13 +174,14 @@ class GLUEvaluator:
     def convert_to_actual_components(components):
         return [BIAS_TERMS_DICT[component] for component in components]
 
-    def preprocess_dataset(self, padding, max_sequence_len, batch_size):
+    def preprocess_dataset(self, padding, max_sequence_len, batch_size, train_size=None):
         """Preprocess the train and validation datasets.
 
         Args:
             padding (str): padding method (currently 'max_length' is the suggested method)
-            max_sequence_len (int): the maximum sequence length.
+            max_sequence_len (int): the maximum sequence length
             batch_size (int): training and evaluating batch size
+            train_size (int): clip the train dataset size, if None will use all available samples
 
         """
         LOGGER.info(f'Downloading dataset: {self.task_name}')
@@ -212,7 +212,12 @@ class GLUEvaluator:
         datasets = datasets.map(_preprocess_function, batched=True, load_from_cache_file=False)
 
         self.data_loaders = dict()
-        self.data_loaders['train'] = datasets['train']
+
+        if train_size:
+            perm = np.random.permutation(len(datasets['train']))[:train_size]
+            self.data_loaders['train'] = Dataset.from_dict(datasets['train'][perm])
+        else:
+            self.data_loaders['train'] = datasets['train']
 
         if self.task_name == 'mnli':
             self.data_loaders['validation_matched'] = datasets['validation_matched']
@@ -277,7 +282,7 @@ class GLUEvaluator:
             self.optimizer.step()
             self.model.zero_grad()
 
-            print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r',end='')
+            print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r', end='')
         print('')
 
     def _evaluate(self, dataloader, dataloader_type):
@@ -329,17 +334,18 @@ class GLUEvaluator:
 
         return results
 
-    def _deactivate_relevant_gradients(self, encoder_trainable, trainable_components):
+    def _deactivate_relevant_gradients(self, trainable_components):
         # turn off the model parameters requires_grad except the trainable bias terms.
-        if not encoder_trainable:
-            for param in self.model.parameters():
-                param.requires_grad = False
-            trainable_components = trainable_components + ['pooler.dense.bias', 'classifier']
-            for name, param in self.model.named_parameters():
-                for component in trainable_components:
-                    if component in name:
-                        param.requires_grad = True
-                        break
+        for param in self.model.parameters():
+            param.requires_grad = False
+        if trainable_components:
+            trainable_components = trainable_components + ['pooler.dense.bias']
+        trainable_components = trainable_components + ['classifier']
+        for name, param in self.model.named_parameters():
+            for component in trainable_components:
+                if component in name:
+                    param.requires_grad = True
+                    break
 
     def training_preparation(self, learning_rate, encoder_trainable, trainable_components, optimizer, verbose=True):
         """Perform training preparation including: model initialization, optimizer definition,
@@ -362,7 +368,8 @@ class GLUEvaluator:
         # model declaration
         config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
         self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
-        self._deactivate_relevant_gradients(encoder_trainable, trainable_components)
+        if not encoder_trainable:
+            self._deactivate_relevant_gradients(trainable_components)
 
         # optimizer declaration
         if optimizer == 'adam':
@@ -375,19 +382,19 @@ class GLUEvaluator:
         self.learning_rate = learning_rate
 
         if verbose:
-            LOGGER.info('Trainable Components:\n----------------------------------------\n')
+            print('Trainable Components:\n----------------------------------------\n')
             total_trainable_params = 0
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    LOGGER.info(name, '  --->  ', param.shape)
+                    print(name, '  --->  ', param.shape)
                     total_trainable_params += param.shape[0] if len(param.shape) == 1 else param.shape[0] * param.shape[
                         1]
-            LOGGER.info(f'\n----------------------------------------\nTrainable Parameters: {total_trainable_params}')
+            print(f'\n----------------------------------------\nTrainable Parameters: {total_trainable_params}')
 
         self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
                             self.data_loaders.keys()}
 
-    def train_and_evaluate(self, num_epochs, output_path):
+    def train_and_evaluate(self, num_epochs, output_path=None, evaluation_frequency=1):
         """Trains the encoder model and evaluate it on validation set.
 
         Learning curves will be saved to the output_path.
@@ -395,6 +402,7 @@ class GLUEvaluator:
         Args:
             num_epochs (int): Number of epochs to perform.
             output_path (str): Directory path to save the learning curves too.
+            evaluation_frequency (int): will evaluate every `evaluation_frequency` epochs.
 
         """
         if not self.data_loaders:
@@ -411,17 +419,18 @@ class GLUEvaluator:
             self._train(self.data_loaders['train'], epoch)
 
             # Evaluation
-            for dataloader_type, dataloader in self.data_loaders.items():
-                if not ('test' in dataloader_type):
-                    results = self._evaluate(dataloader, dataloader_type.upper())
-                    for metric_name, result in results.items():
-                        self.evaluations[dataloader_type][metric_name].append(result)
+            if not epoch % evaluation_frequency:
+                for dataloader_type, dataloader in self.data_loaders.items():
+                    if not ('test' in dataloader_type):
+                        results = self._evaluate(dataloader, dataloader_type.upper())
+                        for metric_name, result in results.items():
+                            self.evaluations[dataloader_type][metric_name].append(result)
             print('')
 
             # Plotting
             self.plot_evaluations(output_path)
 
-    def plot_evaluations(self, output_path):
+    def plot_evaluations(self, output_path=None):
         """Plot the learning curves for each metric.
 
         Args:
@@ -667,3 +676,8 @@ class GLUEvaluator:
                     file.write(f'{idx}\t{result}\n')
 
         LOGGER.info(f'Test evaluation is over, evaluation artifacts are: {list(test_data_loaders.keys())}')
+
+    def freeze_classifier(self):
+        for name, param in self.model.named_parameters():
+            if 'classifier' in name:
+                param.requires_grad = False
