@@ -1,4 +1,4 @@
-"""BitFit evaluation on GLUE Benchmark. Link to paper: TODO"""
+"""BitFit evaluation on GLUE Benchmark. Link to paper: https://arxiv.org/abs/2106.10199 """
 
 import os
 import re
