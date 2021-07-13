@@ -1,4 +1,4 @@
-# BitFit [Paper](https://arxiv.org/abs/2106.10199)
+# BitFit [(Paper)](https://arxiv.org/abs/2106.10199)
 Simple Parameter-efficient Fine-tuning for Transformer-based Masked Language-models
 
 # Abstract
