@@ -2,12 +2,10 @@ import argparse
 import os
 import logging
 from utils import setup_logging
-from GLUEvaluator import GLUEvaluator
-
+from GLUEvaluator import GLUEvaluator, set_seed
 
 setup_logging()
 LOGGER = logging.getLogger(__file__)
-
 
 PADDING = "max_length"
 MAX_SEQUENCE_LEN = 128
@@ -31,6 +29,7 @@ def parse_args():
                         help='bias terms to BitFit, choose \'all\' for BitFit all bias terms.')
     parser.add_argument('--gpu-device', '-d', type=int, default=None,
                         help='GPU id for BitFit, if not mentioned will train on CPU.')
+    parser.add_argument('--seed', '-s', type=int, default=0, help='seed value to set.')
     parser.add_argument('--learning-rate', '-l', type=float, default=1e-3, help='learning rate for training.')
     parser.add_argument('--epochs', '-e', type=int, default=16, help='number of training epochs.')
     parser.add_argument('--batch-size', '-b', type=int, default=8, help='training and evaluation batch size.')
@@ -46,13 +45,16 @@ def parse_args():
 
 def validate_args(args):
     if not os.path.exists(args.output_path):
-        raise ValueError('--output_path directory doesn\'t exist.')
+        raise ValueError("--output_path directory doesn't exist.")
+    if not os.path.isdir(args.output_path):
+        raise ValueError("--output_path must be a path to directory")
     if len(os.listdir(args.output_path)):
-        raise ValueError('--output_path directory isn\'t empty, please supply an empty directory path.')
+        raise ValueError("--output_path directory isn't empty, please supply an empty directory path.")
 
 
 def plot_training_details(args):
-    [LOGGER.info('############################################################################################') for _ in range(3)]
+    [LOGGER.info('############################################################################################') for _
+     in range(3)]
     LOGGER.info('')
 
     LOGGER.info('Training Details: ')
@@ -77,11 +79,11 @@ def plot_training_details(args):
     LOGGER.info(f"Optimizer: {'AdamW' if args.optimizer == 'adamw' else 'Adam'}")
 
     LOGGER.info('')
-    [LOGGER.info('############################################################################################') for _ in range(3)]
+    [LOGGER.info('############################################################################################') for _
+     in range(3)]
 
 
 def main():
-
     # args parsing
     args = parse_args()
     validate_args(args)
@@ -98,7 +100,7 @@ def main():
     evaluator.training_preparation(args.learning_rate, args.full_ft, trainable_components, args.optimizer, verbose=True)
 
     # train
-    evaluator.train_and_evaluate(args.epochs, args.output_path)
+    evaluator.train_and_evaluate(args.epochs, args.output_path, seed=args.seed)
 
     # artifacts
     if not args.full_ft:

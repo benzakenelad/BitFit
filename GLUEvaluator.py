@@ -17,7 +17,9 @@ from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from datasets.arrow_dataset import Dataset
+from utils import setup_logging
 
+setup_logging()
 LOGGER = logging.getLogger(__file__)
 
 torch.manual_seed(0)
@@ -335,7 +337,7 @@ class GLUEvaluator:
         return results
 
     def _deactivate_relevant_gradients(self, trainable_components):
-        # turn off the model parameters requires_grad except the trainable bias terms.
+        # turns off the model parameters requires_grad except the trainable bias terms.
         for param in self.model.parameters():
             param.requires_grad = False
         if trainable_components:
@@ -394,7 +396,7 @@ class GLUEvaluator:
         self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
                             self.data_loaders.keys()}
 
-    def train_and_evaluate(self, num_epochs, output_path=None, evaluation_frequency=1):
+    def train_and_evaluate(self, num_epochs, output_path=None, evaluation_frequency=1, seed=0):
         """Trains the encoder model and evaluate it on validation set.
 
         Learning curves will be saved to the output_path.
@@ -403,8 +405,10 @@ class GLUEvaluator:
             num_epochs (int): Number of epochs to perform.
             output_path (str): Directory path to save the learning curves too.
             evaluation_frequency (int): will evaluate every `evaluation_frequency` epochs.
+            seed(int): seed value
 
         """
+
         if not self.data_loaders:
             raise Exception('data loaders were not initialized, please run "preprocess_dataset" before training.')
 
@@ -414,6 +418,7 @@ class GLUEvaluator:
         if self.device is not None:
             self.model.cuda(self.device)
 
+        set_seed(seed)
         for epoch in range(num_epochs):
             # Training
             self._train(self.data_loaders['train'], epoch)
@@ -578,9 +583,9 @@ class GLUEvaluator:
         return evaluator
 
     def randomize_mask(self, mask_size=100000):
-        """Randomly choose `mask_size` parameters from the model and generating a boolean mask for every component.
+        """Randomly chooses `mask_size` parameters from the model and generating a boolean mask for every component.
 
-        Randomly sample `mask_size` parameters as in BitFit from the entire model, and fine-tuned only them.
+        Randomly sample `mask_size` parameters as in BitFit from the entire model parameters, and fine-tuned only them.
 
         Args:
             mask_size (int): number of trainable parameters.
@@ -613,6 +618,43 @@ class GLUEvaluator:
                     mask[index] = True
                 else:
                     mask[int(index / param.shape[1]), index % param.shape[1]] = True
+
+    def randomize_row_and_column_mask(self):
+        """Initializes the mask by randomly choosing rows or column from each weight
+
+        Initializes the mask by randomly choosing rows or column from each weight, the amount of total non-masked
+        parameters is the same as the matching bias's size.
+
+        """
+        if not self.encoder_trainable:
+            raise Exception('In order to train with random mask the encoder must be trainable.')
+
+        self.masks = dict()
+        total_params = 0
+        for name, param in self.model.bert.named_parameters():
+            self.masks[name] = torch.zeros(param.size(), dtype=torch.bool)
+            total_params += reduce(lambda x, y: x * y, param.shape)
+
+            if ('encoder' not in name and 'pooler' not in name) or 'weight' not in name:
+                continue
+
+            if len(param.shape) == 1 and 'LayerNorm' in name:  # in case it's a LayerNorm
+                self.masks[name][:] = True
+                continue
+
+            if np.random.randint(0, 2) or param.shape[0] < param.shape[1]:  # we randomly choose a column
+                n_columns = int(param.shape[1])
+                column_index = np.random.randint(0, n_columns)
+                self.masks[name][:, column_index] = True
+            else:  # we randomly choose rows
+                bias_shape = int(param.shape[0])
+                row_size = int(param.shape[1])
+                n_rows_to_activate = int(bias_shape / row_size)
+                row_indices = np.random.randint(0, bias_shape, n_rows_to_activate)
+                self.masks[name][row_indices] = True
+
+        LOGGER.info(f'Mask size: {int(np.sum([np.sum(mask.numpy()) for mask in self.masks.values()]))}. '
+                    f'Total params: {total_params}')
 
     def export_model_test_set_predictions(self, output_path):
         """Infers on test set and saves the predictions to output_path (predictions are in GLUE test server format).
