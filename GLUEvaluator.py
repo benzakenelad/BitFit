@@ -22,9 +22,6 @@ from utils import setup_logging
 setup_logging()
 LOGGER = logging.getLogger(__file__)
 
-torch.manual_seed(0)
-np.random.seed(0)
-
 
 def set_seed(seed):
     torch.manual_seed(seed)
