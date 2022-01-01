@@ -265,10 +265,14 @@ class GLUEvaluator:
             # backward pass
             loss.backward()
 
-            # masking the gradients
+            # masking the gradients (if mask exists)
             if self.masks:
-                for name, param in self.model.bert.named_parameters():
-                    param.grad[~self.masks[name]] = 0
+                if 'roberta' in self.model_name:
+                    for name, param in self.model.roberta.named_parameters():
+                        param.grad[~self.masks[name]] = 0
+                else:
+                    for name, param in self.model.bert.named_parameters():
+                        param.grad[~self.masks[name]] = 0
 
             # track train loss
             loss_sum += loss.item()
@@ -346,22 +350,28 @@ class GLUEvaluator:
                     param.requires_grad = True
                     break
 
-    def training_preparation(self, learning_rate, encoder_trainable, trainable_components, optimizer, verbose=True):
-        """Perform training preparation including: model initialization, optimizer definition,
+    def training_preparation(self, learning_rate, optimizer, encoder_trainable, trainable_components=None,
+                             verbose=True):
+        """Performs training preparation.
 
         Perform training preparation including: model initialization, optimizer initialization, relevant
-        gradients deactivation and plotting a list of all trainable params.
+        gradients deactivation and plotting a list of all trainable params (if verbose is True).
 
         Args:
             learning_rate (float): learning_rate to train with.
-            encoder_trainable (bool): if True will perform a Full-FT else will perform BitFit training preparation.
-            trainable_components(list[str]): list of trainable component. (subset of `BIAS_TERMS_DICT` keys)
             optimizer(str): optimizer to perform the training with, currently adam and adamw are supported.
+            encoder_trainable (bool): if True will perform a Full-FT else will perform BitFit training preparation.
+            trainable_components(Union[List[str], None]): list of trainable component. (subset of `BIAS_TERMS_DICT` keys)
             verbose: if True will plot a list of all trainable params
 
         """
         if self.model:
             raise Exception('Training preparation was already completed.')
+
+        if encoder_trainable and trainable_components:
+            raise Exception(
+                f"If encoder_trainable is True, you shouldn't supply trainable_components. "
+                f"Got trainable_components: {trainable_components}")
 
         self.encoder_trainable = encoder_trainable
         # model declaration
@@ -381,19 +391,20 @@ class GLUEvaluator:
         self.learning_rate = learning_rate
 
         if verbose:
-            print('Trainable Components:\n----------------------------------------\n')
+            print('\n\nTrainable Components:\n----------------------------------------\n')
             total_trainable_params = 0
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
                     print(name, '  --->  ', param.shape)
                     total_trainable_params += param.shape[0] if len(param.shape) == 1 else param.shape[0] * param.shape[
                         1]
-            print(f'\n----------------------------------------\nTrainable Parameters: {total_trainable_params}')
+            print(
+                f'\n----------------------------------------\nNumber of Trainable Parameters: {total_trainable_params}\n')
 
         self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
                             self.data_loaders.keys()}
 
-    def train_and_evaluate(self, num_epochs, output_path=None, evaluation_frequency=1, seed=0):
+    def train_and_evaluate(self, num_epochs, output_path=None, evaluation_frequency=1):
         """Trains the encoder model and evaluate it on validation set.
 
         Learning curves will be saved to the output_path.
@@ -402,7 +413,6 @@ class GLUEvaluator:
             num_epochs (int): Number of epochs to perform.
             output_path (str): Directory path to save the learning curves too.
             evaluation_frequency (int): will evaluate every `evaluation_frequency` epochs.
-            seed(int): seed value
 
         """
 
@@ -415,7 +425,6 @@ class GLUEvaluator:
         if self.device is not None:
             self.model.cuda(self.device)
 
-        set_seed(seed)
         for epoch in range(num_epochs):
             # Training
             self._train(self.data_loaders['train'], epoch)
@@ -442,9 +451,11 @@ class GLUEvaluator:
         for metric_name in TASK_TO_METRICS[self.task_name]:
             for dataloader_type, results_mapper in self.evaluations.items():
                 if not ('test' in dataloader_type):
-                    label = f'{dataloader_type}_{round(max(results_mapper[metric_name]) * 100, 2)}'
+                    label = f'{dataloader_type} (max is {round(max(results_mapper[metric_name]) * 100, 2)})'
                     plt.plot(results_mapper[metric_name], label=label)
-            plt.title(metric_name)
+            plt.title(f'Learning Curves - {self.task_name}')
+            plt.xlabel('Epoch')
+            plt.ylabel(metric_name)
             plt.legend()
             if output_path:
                 plt.savefig(os.path.join(output_path, f'learning_curves_{metric_name.lower()}'))
@@ -462,26 +473,30 @@ class GLUEvaluator:
             output_path (str): Directory path to save the terms changes heatmap too, if None will print the figure.
 
         """
-        base_model = AutoModelForSequenceClassification.from_pretrained(self.model_name, return_dict=True)
-        fine_tuned_model = self.model.cpu()
+        if self.encoder_trainable:
+            raise ValueError('Can plot terms changes only when BitFit.')
+
+        if output_path:
+            LOGGER.info(f'Saving the BitFit bias terms changes to: {output_path}')
+
+        if 'roberta' in self.model_name:
+            base_model = AutoModelForSequenceClassification.from_pretrained(self.model_name, return_dict=True).roberta
+            fine_tuned_model = self.model.cpu().roberta
+        else:
+            base_model = AutoModelForSequenceClassification.from_pretrained(self.model_name, return_dict=True).bert
+            fine_tuned_model = self.model.cpu().bert
+
         num_layers = self.model.config.num_hidden_layers
 
         def _calc_mean_diff(ft_p, base_p):
             return np.mean(np.abs(np.array(ft_p.data - base_p.data)))
 
         changes = []
-        if 'roberta' in self.model_name:  # roberta
-            for ft_name, ft_param in fine_tuned_model.roberta.named_parameters():
-                if ft_param.requires_grad and 'layer' in ft_name:
-                    for base_name, base_param in base_model.roberta.named_parameters():
-                        if ft_name == base_name:
-                            changes.append({'name': ft_name, 'value': _calc_mean_diff(ft_param, base_param)})
-        else:  # bert
-            for ft_name, ft_param in fine_tuned_model.bert.named_parameters():
-                if ft_param.requires_grad and 'layer' in ft_name:
-                    for base_name, base_param in base_model.bert.named_parameters():
-                        if ft_name == base_name:
-                            changes.append({'name': ft_name, 'value': _calc_mean_diff(ft_param, base_param)})
+        for ft_name, ft_param in fine_tuned_model.named_parameters():
+            if ft_param.requires_grad and 'layer' in ft_name:
+                for base_name, base_param in base_model.named_parameters():
+                    if ft_name == base_name:
+                        changes.append({'name': ft_name, 'value': _calc_mean_diff(ft_param, base_param)})
 
         def _get_component_name(name):
             return re.split(r'.[0-9]+.', name)[1]
@@ -532,23 +547,14 @@ class GLUEvaluator:
         if self.device is not None:
             self.model.cuda(self.device)
 
-    def save(self, output_path=None):
+    def save(self, output_path):
         """Saves the evaluator to the output_path.
 
         Args:
             output_path (str): Directory to save to model to.
 
         """
-
-        if not output_path:
-            fine_tuned = 'full_FT' if self.encoder_trainable else 'bitfit'
-            output_path = f'{self.model_name}__{fine_tuned}__{self.task_name}__'
-            for dataset_name, metrics in self.evaluations.items():
-                if not ('test' in dataset_name):
-                    output_path += f'{dataset_name}_'
-                    for metric_name, scores in metrics.items():
-                        output_path += f'{metric_name}_{round(max(scores), 3)}_'
-                    output_path += '_'
+        LOGGER.info(f'Saving the model to: {output_path}')
 
         self.model.cpu()
         data = {'model': self.model, 'model_name': self.model_name, 'task_name': self.task_name,
@@ -579,21 +585,27 @@ class GLUEvaluator:
 
         return evaluator
 
-    def randomize_mask(self, mask_size=100000):
-        """Randomly chooses `mask_size` parameters from the model and generating a boolean mask for every component.
+    def set_uniform_mask(self, mask_size):
+        """Uniformly chooses `mask_size` parameters from the model and generates a boolean mask for every component.
 
-        Randomly sample `mask_size` parameters as in BitFit from the entire model parameters, and fine-tuned only them.
+        Uniformly sample `mask_size` parameters from the entire model parameters, and in fine-tuning process only them
+        will be fine-tuned.
 
         Args:
-            mask_size (int): number of trainable parameters.
+            mask_size (int): number of non-masked parameters.
 
         """
         if not self.encoder_trainable:
-            raise Exception('In order to train with random mask the encoder must be trainable.')
+            raise Exception('In order to train with a random mask the encoder must be trainable.')
+
+        if 'roberta' in self.model_name:
+            model = self.model.roberta
+        else:
+            model = self.model.bert
 
         total_params = 0
         self.masks, params_per_component = dict(), dict()
-        for name, param in self.model.bert.named_parameters():
+        for name, param in model.named_parameters():
             self.masks[name] = torch.zeros(param.size(), dtype=torch.bool)
             component_params = reduce(lambda x, y: x * y, param.shape)
             params_per_component[name] = component_params
@@ -602,10 +614,10 @@ class GLUEvaluator:
         tunable_params_per_component = {k: int((v * mask_size) / total_params) for k, v in
                                         params_per_component.items()}
 
-        LOGGER.info(f'Mask size: {reduce(lambda x, y: x + y, tunable_params_per_component.values())}. '
+        LOGGER.info(f'Non-Masked params amount: {reduce(lambda x, y: x + y, tunable_params_per_component.values())}. '
                     f'Total params: {total_params}')
 
-        for name, param in self.model.bert.named_parameters():
+        for name, param in model.named_parameters():
             component_mask_size = tunable_params_per_component[name]
             component_params = params_per_component[name]
             indices = np.random.randint(0, component_params, component_mask_size)
@@ -616,19 +628,24 @@ class GLUEvaluator:
                 else:
                     mask[int(index / param.shape[1]), index % param.shape[1]] = True
 
-    def randomize_row_and_column_mask(self):
-        """Initializes the mask by randomly choosing rows or column from each weight
+    def set_row_and_column_random_mask(self):
+        """Initializes the mask by randomly choosing rows or a column from each weight
 
-        Initializes the mask by randomly choosing rows or column from each weight, the amount of total non-masked
-        parameters is the same as the matching bias's size.
+        Initializes the mask by randomly choosing rows or a column (column size is equal the bias size) from each
+        weight, the amount of total non-masked parameters in each weight is equal to the matching bias param size.
 
         """
         if not self.encoder_trainable:
-            raise Exception('In order to train with random mask the encoder must be trainable.')
+            raise Exception('In order to train with a random mask the encoder must be trainable.')
+
+        if 'roberta' in self.model_name:
+            model = self.model.roberta
+        else:
+            model = self.model.bert
 
         self.masks = dict()
         total_params = 0
-        for name, param in self.model.bert.named_parameters():
+        for name, param in model.named_parameters():
             self.masks[name] = torch.zeros(param.size(), dtype=torch.bool)
             total_params += reduce(lambda x, y: x * y, param.shape)
 
@@ -650,7 +667,7 @@ class GLUEvaluator:
                 row_indices = np.random.randint(0, bias_shape, n_rows_to_activate)
                 self.masks[name][row_indices] = True
 
-        LOGGER.info(f'Mask size: {int(np.sum([np.sum(mask.numpy()) for mask in self.masks.values()]))}. '
+        LOGGER.info(f'Non-Masked params amount: {int(np.sum([np.sum(mask.numpy()) for mask in self.masks.values()]))}. '
                     f'Total params: {total_params}')
 
     def export_model_test_set_predictions(self, output_path):
@@ -669,6 +686,8 @@ class GLUEvaluator:
 
         if self.device is not None:
             self.model.cuda(self.device)
+
+        LOGGER.info(f'Exporting model test set predictions to: {output_path}.')
 
         test_data_loaders = dict()
         if self.task_name == 'mnli':
