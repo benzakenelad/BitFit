@@ -15,13 +15,14 @@ Then activate it:
 $ conda activate bitfit_env
 ```
 
-# Evaluating [GLUE Benchmark](https://arxiv.org/abs/1804.07461) with BitFit
+# [GLUE Benchmark](https://arxiv.org/abs/1804.07461) evaluation examples:
 
 ```
-python run_glue.py --task-name <task_name>\
+python run_glue.py 
        --output-path <output_path>\
+       --task-name <task_name>\
        --model-name <model_name>\
-       --full-ft\
+       --fine-tune-type <fine_tune_type>\
        --bias-terms <bias_terms>\
        --gpu-device <gpu_device>\
        --learning-rate <learning_rate>\
@@ -29,16 +30,71 @@ python run_glue.py --task-name <task_name>\
        --batch-size <batch_size>\
        --optimizer <optimizer_name>\
        --save-evaluator\
-       --predict-test
+       --predict-test\
+       --verbose
 ```
 For further information about the arguments run:
 ```
 python run_glue.py -h
 ```
 
-Example of running full BitFit (training all bias terms):
+Example of executing full fine tuning:
 ```
-python run_glue.py --task-name rte\
+python run_glue.py 
        --output-path <output_path>\
-       --model-name bert-base-cased
+       --task-name rte\  
+       --model-name bert-base-cased\
+       --fine-tune-type full_ft\
+       --learning-rate 1e-5
 ```
+
+Example of executing full BitFit (training all bias terms):
+```
+python run_glue.py 
+       --output-path <output_path>\
+       --task-name rte\
+       --model-name bert-base-cased\
+       --fine-tune-type bitfit\
+       --learning-rate 1e-3
+```
+
+Example of executing partial BitFit (training a subset of the bias terms):
+```
+python run_glue.py 
+       --output-path <output_path>\
+       --task-name rte\
+       --model-name bert-base-cased\
+       --fine-tune-type bitfit\
+       --bias-terms query intermediate\ 
+       --learning-rate 1e-3
+```
+
+Example of executing "frozen" training (i.e. using the pre-trained transformer as a feature extractor):
+```
+python run_glue.py 
+       --output-path <output_path>\
+       --task-name rte\
+       --model-name bert-base-cased\
+       --fine-tune-type frozen\
+       --learning-rate 1e-3
+```
+
+Example of training uniformly chosen trainable parameters (similar to "rand_100k" row in Table 3 in BitFit paper)
+```
+python run_glue.py 
+       --output-path <output_path>\
+       --task-name rte\
+       --model-name bert-base-cased\
+       --fine-tune-type rand_uniform\
+       --learning-rate 1e-3
+```
+
+<!-- Example of training uniformly chosen rows/cols from weight matrices (similar to "rand_row_col" row in Table 3 in BitFit paper)
+```
+python run_glue.py 
+       --output-path <output_path>\
+       --task-name rte\
+       --model-name bert-base-cased\
+       --fine-tune-type rand_uniform\
+       --learning-rate 1e-3
+``` -->
