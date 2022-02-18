@@ -1,8 +1,17 @@
+"""This file contains a tool that wraps the GLUEvaluator API, the tool supports all the evaluations that were
+performed in BitFit paper (https://arxiv.org/abs/1804.07461), such as: 'full_ft', 'bitfit', 'frozen', 'rand_uniform'
+and 'rand_row_col'.
+
+For questions please reach: benzakenelad@gmail.com
+
+Author Elad Ben-Zaken
+"""
 import argparse
 import os
 import logging
+
 from utils import setup_logging
-from GLUEvaluator import GLUEvaluator, set_seed
+from glue_evaluator import GLUEvaluator, set_seed
 
 setup_logging()
 LOGGER = logging.getLogger(__file__)
@@ -101,7 +110,7 @@ def _perform_training_preparations(evaluator, args, trainable_components):
                                        optimizer=args.optimizer,
                                        encoder_trainable=True,
                                        verbose=args.verbose)
-    elif args.fine_tune_type == 'bitfit' or args.fine_tune_type == 'frozen':
+    elif args.fine_tune_type in {'bitfit', 'frozen'}:
         evaluator.training_preparation(learning_rate=args.learning_rate,
                                        optimizer=args.optimizer,
                                        encoder_trainable=False,

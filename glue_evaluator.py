@@ -1,22 +1,32 @@
-"""BitFit evaluation on GLUE Benchmark. Link to paper: https://arxiv.org/abs/2106.10199 """
+"""This file contains the GLUEvaluator class which exposes an API for all the evaluations that were performed in
+BitFit paper (https://arxiv.org/abs/1804.07461), such as: 'full_ft', 'bitfit', 'frozen', 'rand_uniform' and
+'rand_row_col'.
+
+For questions please reach: benzakenelad@gmail.com
+
+Author Elad Ben-Zaken
+"""
 
 import os
 import re
+from functools import reduce
+
 import logging
 import pickle
-import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from seaborn import heatmap
-from functools import reduce
-from torch.optim import Adam
-from datasets import load_dataset
-from transformers.optimization import AdamW
 from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
+
+import torch
+from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
+from datasets import load_dataset
+from transformers.optimization import AdamW
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 from datasets.arrow_dataset import Dataset
+
 from utils import setup_logging
 
 setup_logging()
@@ -108,18 +118,20 @@ BIAS_LAYER_NAME_TO_LATEX = {
 
 
 class GLUEvaluator:
-    """This class contains the functionality for BitFit evaluation on GLUE benchmark.
+    """This class contains all the functionality for GLUE benchmark evaluations that were performed in BitFit paper.
 
-    This class expose an API for evaluating BitFit on GLUE Benchmark (https://arxiv.org/abs/1804.07461).
-
-    Attributes:
-        task_name (str): task name, e.g. 'rte'.
-        model_name (str): model name, e.g. 'bert-base-uncased'.
-        device (str): GPU device to run on, if None will run on CPU.
-
+    This class exposes an API for all the evaluations that were performed in BitFit paper
+    (https://arxiv.org/abs/1804.07461), such as: 'full_ft', 'bitfit', 'frozen', 'rand_uniform' and 'rand_row_col'.
     """
 
     def __init__(self, task_name, model_name, device):
+        """
+        Args:
+            task_name (str): task name, e.g. 'rte'.
+            model_name (str): model name, e.g. 'bert-base-uncased'.
+            device (int): GPU device to run on, if None will run on CPU.
+
+        """
         self.task_name = task_name
         self.model_name = model_name
         self.device = device
@@ -136,42 +148,6 @@ class GLUEvaluator:
         self.encoder_trainable = None
         self.masks = None
         self.idx_to_label = None
-
-    @staticmethod
-    def convert_dataset_to_data_loader(dataset, model_name, batch_size, random_sampler, test=False):
-        """Convert a Dataset to torch DataLoader.
-
-        Args:
-            dataset (datasets.arrow_dataset.Dataset): the dataset to convert to torch DataLoader.
-            model_name (str): model name (e.g. bert-base-uncased).
-            batch_size (int): batch size for training and evaluation.
-            random_sampler (bool): if True, DataLoader will sample randomly else sequentially.
-            test (bool): if True, dataset contains test samples.
-
-        """
-        if test:
-            keys = ['input_ids', 'attention_mask', 'token_type_ids']
-        else:
-            keys = ['input_ids', 'attention_mask', 'token_type_ids', 'label']
-
-        if 'roberta' in model_name:
-            keys.remove('token_type_ids')
-
-        data = {key: list() for key in keys}
-        for sample in dataset:
-            for key in keys:
-                data[key].append(sample[key])
-
-        for k, v in data.items():
-            data[k] = torch.tensor(v)
-
-        tensor_dataset = TensorDataset(*[data[key] for key in keys])
-        data_sampler = RandomSampler(tensor_dataset) if random_sampler else SequentialSampler(tensor_dataset)
-        return DataLoader(tensor_dataset, sampler=data_sampler, batch_size=batch_size)
-
-    @staticmethod
-    def convert_to_actual_components(components):
-        return [BIAS_TERMS_DICT[component] for component in components]
 
     def preprocess_dataset(self, padding, max_sequence_len, batch_size, train_size=None):
         """Preprocess the train and validation datasets.
@@ -228,127 +204,11 @@ class GLUEvaluator:
             self.data_loaders['test'] = datasets['test']
 
         for dataset_name, dataset in self.data_loaders.items():
-            self.data_loaders[dataset_name] = self.convert_dataset_to_data_loader(dataset=dataset,
-                                                                                  model_name=self.model_name,
-                                                                                  batch_size=self.batch_size,
-                                                                                  random_sampler=dataset_name == 'train',
-                                                                                  test='test' in dataset_name)
-
-    def _train(self, train_dataloader, epoch, max_grad_norm=1.0):
-        # train the model
-        self.model.train()
-        trained_samples, loss_sum = 0, 0
-        criteria = torch.nn.MSELoss() if self.is_regression else torch.nn.CrossEntropyLoss()
-        n = len(train_dataloader.dataset)
-
-        for step, batch in enumerate(train_dataloader):
-            # move batch to gpu
-            if self.device is not None:
-                batch = tuple(obj.cuda(self.device) for obj in batch)
-
-            if 'roberta' in self.model_name:
-                input_ids, attention_mask, labels = batch
-                token_type_ids = None
-            else:
-                input_ids, attention_mask, token_type_ids, labels = batch
-
-            # forward pass
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-            outputs = outputs.logits
-
-            # loss calculation
-            labels = labels.view(-1)
-            outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
-
-            loss = criteria(outputs, labels)
-
-            # backward pass
-            loss.backward()
-
-            # masking the gradients (if mask exists)
-            if self.masks:
-                if 'roberta' in self.model_name:
-                    for name, param in self.model.roberta.named_parameters():
-                        param.grad[~self.masks[name]] = 0
-                else:
-                    for name, param in self.model.bert.named_parameters():
-                        param.grad[~self.masks[name]] = 0
-
-            # track train loss
-            loss_sum += loss.item()
-            trained_samples += len(labels)
-
-            # gradient clipping
-            torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=max_grad_norm)
-
-            # update parameters
-            self.optimizer.step()
-            self.model.zero_grad()
-
-            print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r', end='')
-        print('')
-
-    def _evaluate(self, dataloader, dataloader_type):
-        # evaluate model on validation set
-        self.model.eval()
-        evaluated_samples, accuracy_sum = 0, 0
-        all_preds, all_labels = [], []
-
-        for step, batch in enumerate(dataloader):
-            # move batch to gpu
-            if self.device is not None:
-                batch = tuple(obj.cuda(self.device) for obj in batch)
-            if 'roberta' in self.model_name:
-                input_ids, attention_mask, labels = batch
-                token_type_ids = None
-            else:
-                input_ids, attention_mask, token_type_ids, labels = batch
-
-            # forward pass
-            with torch.no_grad():
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-                outputs = outputs.logits
-
-            # reshaping
-            labels = labels.view(-1)
-            outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
-
-            outputs = outputs.detach().cpu().numpy()
-            labels = labels.cpu().numpy()
-
-            evaluated_samples += len(labels)
-
-            if not self.is_regression:
-                outputs = np.argmax(outputs, axis=1)
-                # accuracy calculation
-                accuracy_sum += accuracy_score(labels, outputs) * len(labels)
-                print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
-
-            all_preds.extend(list(outputs))
-            all_labels.extend(list(labels))
-
-        print('')
-        results = {}
-        for metric_name in TASK_TO_METRICS[self.task_name]:
-            metric = METRIC_NAME_TO_FUNCTION[metric_name]
-            result = metric(all_labels, all_preds)
-            result = result[0] if self.is_regression else result
-            results[metric_name] = result
-
-        return results
-
-    def _deactivate_relevant_gradients(self, trainable_components):
-        # turns off the model parameters requires_grad except the trainable bias terms.
-        for param in self.model.parameters():
-            param.requires_grad = False
-        if trainable_components:
-            trainable_components = trainable_components + ['pooler.dense.bias']
-        trainable_components = trainable_components + ['classifier']
-        for name, param in self.model.named_parameters():
-            for component in trainable_components:
-                if component in name:
-                    param.requires_grad = True
-                    break
+            self.data_loaders[dataset_name] = self._convert_dataset_to_data_loader(dataset=dataset,
+                                                                                   model_name=self.model_name,
+                                                                                   batch_size=self.batch_size,
+                                                                                   random_sampler=dataset_name == 'train',
+                                                                                   test='test' in dataset_name)
 
     def training_preparation(self, learning_rate, optimizer, encoder_trainable, trainable_components=None,
                              verbose=True):
@@ -361,7 +221,7 @@ class GLUEvaluator:
             learning_rate (float): learning_rate to train with.
             optimizer(str): optimizer to perform the training with, currently adam and adamw are supported.
             encoder_trainable (bool): if True will perform a Full-FT else will perform BitFit training preparation.
-            trainable_components(Union[List[str], None]): list of trainable component. (subset of `BIAS_TERMS_DICT` keys)
+            trainable_components(Union[List[str], None]): list of trainable component.(subset of `BIAS_TERMS_DICT` keys)
             verbose: if True will plot a list of all trainable params
 
         """
@@ -416,20 +276,23 @@ class GLUEvaluator:
 
         """
 
+        # validations
         if not self.data_loaders:
             raise Exception('data loaders were not initialized, please run "preprocess_dataset" before training.')
 
         if not self.model:
             raise Exception('model was not initialized, please run "training_preparation" before training.')
 
+        # moving model to the required device
         if self.device is not None:
             self.model.cuda(self.device)
 
+        # train and evaluate
         for epoch in range(num_epochs):
-            # Training
+            # training for a single epoch
             self._train(self.data_loaders['train'], epoch)
 
-            # Evaluation
+            # evaluation
             if not epoch % evaluation_frequency:
                 for dataloader_type, dataloader in self.data_loaders.items():
                     if not ('test' in dataloader_type):
@@ -438,10 +301,124 @@ class GLUEvaluator:
                             self.evaluations[dataloader_type][metric_name].append(result)
             print('')
 
-            # Plotting
-            self.plot_evaluations(output_path)
+            # plot learning curves
+            self.plot_learning_curves(output_path)
 
-    def plot_evaluations(self, output_path=None):
+    def save(self, output_path):
+        """Saves the evaluator to the output_path directory.
+
+        Args:
+            output_path (str): Directory to save to model to.
+
+        """
+        LOGGER.info(f'Saving the model to: {output_path}')
+
+        self.model.cpu()
+        data = {'model': self.model, 'model_name': self.model_name, 'task_name': self.task_name,
+                'learning_rate': self.learning_rate, 'evaluations': self.evaluations,
+                'batch_size': self.batch_size, 'num_labels': self.num_labels,
+                'encoder_trainable': self.encoder_trainable}
+        with open(output_path, 'wb') as file:
+            pickle.dump(data, file)
+
+    @staticmethod
+    def load(path, gpu_device):
+        """Loads the evaluator from `path`.
+
+        Args:
+            path (str): Directory to load to model from.
+            gpu_device (int): GPU device ID.
+
+        Returns:
+            (GLUEvaluator): the GLUEvaluator instance we loaded
+        """
+        with open(path, 'rb') as file:
+            data = pickle.load(file)
+        evaluator = GLUEvaluator(data['task_name'], data['model_name'], gpu_device)
+        evaluator.num_labels = data['num_labels']
+        evaluator.batch_size = data['batch_size']
+        evaluator.model = data['model']
+        evaluator.learning_rate = data['learning_rate']
+        evaluator.evaluations = data['evaluations']
+        evaluator.encoder_trainable = data.get('encoder_trainable', None)
+
+        return evaluator
+
+    def export_model_test_set_predictions(self, output_path):
+        """Infers on test set and saves the predictions to output_path (predictions are in "GLUE test server" format).
+
+        Args:
+            output_path (str): Directory to save the predictions.
+
+        """
+        # validations
+        if not self.data_loaders:
+            raise Exception(
+                'data loaders were not initialized, please run "preprocess_dataset" before test evaluation.')
+
+        if not self.model:
+            raise Exception('model was not initialized, please run "training_preparation" before test evaluation.')
+
+        # move the model the required device
+        if self.device is not None:
+            self.model.cuda(self.device)
+
+        LOGGER.info(f'Exporting model test set predictions to: {output_path}.')
+
+        test_data_loaders = dict()
+        if self.task_name == 'mnli':
+            test_data_loaders["MNLI-m.tsv"] = self.data_loaders["test_matched"]
+            test_data_loaders["MNLI-mm.tsv"] = self.data_loaders["test_mismatched"]
+        else:
+            test_data_loaders[TASK_NAME_TO_SUBMISSION_FILE_NAME[self.task_name]] = self.data_loaders["test"]
+
+        # change to eval mode
+        self.model.eval()
+
+        for prediction_file_name, dataloader in test_data_loaders.items():
+            results = list()
+            counter = 0
+            num_samples = len(dataloader.dataset)
+            for batch in dataloader:
+                # move batch data to gpu
+                if self.device is not None:
+                    batch = tuple(obj.cuda(self.device) for obj in batch)
+
+                input_ids, attention_mask, token_type_ids = batch
+
+                # forward pass
+                with torch.no_grad():
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                         token_type_ids=token_type_ids)
+                    outputs = outputs.logits
+
+                # aggregate results
+                if self.is_regression:
+                    outputs = outputs.view(-1)
+                    outputs = outputs.detach().cpu().numpy()
+                    results.extend(list(outputs))
+                else:
+                    outputs = outputs.view(-1, self.num_labels)
+                    outputs = outputs.detach().cpu().numpy()
+                    outputs = np.argmax(outputs, axis=-1)
+                    if TASK_IS_BINARY[self.task_name]:
+                        results.extend([int(pred) for pred in outputs])
+                    else:
+                        results.extend([self.idx_to_label[pred] for pred in outputs])
+
+                counter += len(outputs)
+                print(f'Test inference progress: {counter}/{num_samples}\r', end='')
+            print('')
+
+            # save the test set results (in "GLUE test server" format)
+            with open(os.path.join(output_path, prediction_file_name), 'w') as file:
+                file.write('index\tprediction\n')
+                for idx, result in enumerate(results):
+                    file.write(f'{idx}\t{result}\n')
+
+        LOGGER.info(f'Test set inference is done, inference artifacts are: {list(test_data_loaders.keys())}')
+
+    def plot_learning_curves(self, output_path=None):
         """Plot the learning curves for each metric.
 
         Args:
@@ -547,44 +524,6 @@ class GLUEvaluator:
         if self.device is not None:
             self.model.cuda(self.device)
 
-    def save(self, output_path):
-        """Saves the evaluator to the output_path.
-
-        Args:
-            output_path (str): Directory to save to model to.
-
-        """
-        LOGGER.info(f'Saving the model to: {output_path}')
-
-        self.model.cpu()
-        data = {'model': self.model, 'model_name': self.model_name, 'task_name': self.task_name,
-                'learning_rate': self.learning_rate, 'evaluations': self.evaluations,
-                'batch_size': self.batch_size, 'num_labels': self.num_labels,
-                'encoder_trainable': self.encoder_trainable}
-        with open(output_path, 'wb') as file:
-            pickle.dump(data, file)
-
-    @staticmethod
-    def load(path, gpu_device):
-        """Loads the evaluator from `path`.
-
-        Args:
-            gpu_device (int): GPU device ID.
-            path (str): Directory to load to model from.
-
-        """
-        with open(path, 'rb') as file:
-            data = pickle.load(file)
-        evaluator = GLUEvaluator(data['task_name'], data['model_name'], gpu_device)
-        evaluator.num_labels = data['num_labels']
-        evaluator.batch_size = data['batch_size']
-        evaluator.model = data['model']
-        evaluator.learning_rate = data['learning_rate']
-        evaluator.evaluations = data['evaluations']
-        evaluator.encoder_trainable = data.get('encoder_trainable', None)
-
-        return evaluator
-
     def set_uniform_mask(self, mask_size):
         """Uniformly chooses `mask_size` parameters from the model and generates a boolean mask for every component.
 
@@ -670,72 +609,187 @@ class GLUEvaluator:
         LOGGER.info(f'Non-Masked params amount: {int(np.sum([np.sum(mask.numpy()) for mask in self.masks.values()]))}. '
                     f'Total params: {total_params}')
 
-    def export_model_test_set_predictions(self, output_path):
-        """Infers on test set and saves the predictions to output_path (predictions are in GLUE test server format).
+    def _deactivate_relevant_gradients(self, trainable_components):
+        """Turns off the model parameters requires_grad except the trainable_components.
 
         Args:
-            output_path (str): Directory to save the predictions.
+            trainable_components (List[str]): list of trainable components (the rest will be deactivated)
 
         """
-        if not self.data_loaders:
-            raise Exception(
-                'data loaders were not initialized, please run "preprocess_dataset" before test evaluation.')
+        for param in self.model.parameters():
+            param.requires_grad = False
+        if trainable_components:
+            trainable_components = trainable_components + ['pooler.dense.bias']
+        trainable_components = trainable_components + ['classifier']
+        for name, param in self.model.named_parameters():
+            for component in trainable_components:
+                if component in name:
+                    param.requires_grad = True
+                    break
 
-        if not self.model:
-            raise Exception('model was not initialized, please run "training_preparation" before test evaluation.')
+    @staticmethod
+    def convert_to_actual_components(components):
+        return [BIAS_TERMS_DICT[component] for component in components]
 
-        if self.device is not None:
-            self.model.cuda(self.device)
+    def _train(self, train_dataloader, epoch, max_grad_norm=1.0):
+        """Trains the model for a single epoch
 
-        LOGGER.info(f'Exporting model test set predictions to: {output_path}.')
+        Args:
+            train_dataloader (torch.utils.data.DataLoader): the train data loader
+            epoch (int): the epoch number (for logging)
+            max_grad_norm (float): the maximum gradient norm we allow. The norm is computed over all gradients together,
+            as if they were concatenated into a single vector.
 
-        test_data_loaders = dict()
-        if self.task_name == 'mnli':
-            test_data_loaders["MNLI-m.tsv"] = self.data_loaders["test_matched"]
-            test_data_loaders["MNLI-mm.tsv"] = self.data_loaders["test_mismatched"]
-        else:
-            test_data_loaders[TASK_NAME_TO_SUBMISSION_FILE_NAME[self.task_name]] = self.data_loaders["test"]
+        """
+        # move to train mode
+        self.model.train()
 
+        # loss initialization
+        criteria = torch.nn.MSELoss() if self.is_regression else torch.nn.CrossEntropyLoss()
+
+        n = len(train_dataloader.dataset)
+        trained_samples = loss_sum = 0
+        for step, batch in enumerate(train_dataloader):
+            # move batch data to gpu
+            if self.device is not None:
+                batch = tuple(obj.cuda(self.device) for obj in batch)
+
+            if 'roberta' in self.model_name:
+                input_ids, attention_mask, labels = batch
+                token_type_ids = None
+            else:
+                input_ids, attention_mask, token_type_ids, labels = batch
+
+            # forward pass
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+            outputs = outputs.logits
+
+            # loss calculation
+            labels = labels.view(-1)
+            outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
+
+            loss = criteria(outputs, labels)
+
+            # backward pass (gradients calculation)
+            loss.backward()
+
+            # masking the relevant gradients (if needed)
+            if self.masks:
+                if 'roberta' in self.model_name:
+                    for name, param in self.model.roberta.named_parameters():
+                        param.grad[~self.masks[name]] = 0
+                else:
+                    for name, param in self.model.bert.named_parameters():
+                        param.grad[~self.masks[name]] = 0
+
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=max_grad_norm)
+
+            # update parameters
+            self.optimizer.step()
+            self.model.zero_grad()
+
+            # track train loss
+            loss_sum += loss.item()
+            trained_samples += len(labels)
+
+            # printing training progress
+            print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r', end='')
+        print('')
+
+    def _evaluate(self, dataloader, dataloader_type):
+        """Evaluates the model on the dataloader
+
+        Args:
+            dataloader (torch.utils.data.DataLoader): the data loader we evaluate the model on
+            dataloader_type (str): the dataloader type (train/validation)
+
+        Returns:
+            (Dict[str, float]): dictionary that maps between metric_name and the metric result
+        """
+        # move to eval mode
         self.model.eval()
 
-        for prediction_file_name, dataloader in test_data_loaders.items():
-            results = list()
-            counter = 0
-            num_samples = len(dataloader.dataset)
-            for batch in dataloader:
-                if self.device is not None:
-                    batch = tuple(obj.cuda(self.device) for obj in batch)
-                input_ids, attention_mask, token_type_ids = batch
+        evaluated_samples = accuracy_sum = 0
+        all_predictions, all_labels = [], []
+        for step, batch in enumerate(dataloader):
+            # move batch data to gpu
+            if self.device is not None:
+                batch = tuple(obj.cuda(self.device) for obj in batch)
 
-                with torch.no_grad():
-                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                                         token_type_ids=token_type_ids)
-                    outputs = outputs.logits
+            if 'roberta' in self.model_name:
+                input_ids, attention_mask, labels = batch
+                token_type_ids = None
+            else:
+                input_ids, attention_mask, token_type_ids, labels = batch
 
-                if self.is_regression:
-                    outputs = outputs.view(-1)
-                    outputs = outputs.detach().cpu().numpy()
-                    results.extend(list(outputs))
-                else:
-                    outputs = outputs.view(-1, self.num_labels)
-                    outputs = outputs.detach().cpu().numpy()
-                    outputs = np.argmax(outputs, axis=-1)
-                    if TASK_IS_BINARY[self.task_name]:
-                        results.extend([int(pred) for pred in outputs])
-                    else:
-                        results.extend([self.idx_to_label[pred] for pred in outputs])
+            # forward pass
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                outputs = outputs.logits
 
-                counter += len(outputs)
-                print(f'Test inference progress: {counter}/{num_samples}\r', end='')
-            print('')
-            with open(os.path.join(output_path, prediction_file_name), 'w') as file:
-                file.write('index\tprediction\n')
-                for idx, result in enumerate(results):
-                    file.write(f'{idx}\t{result}\n')
+            # reshaping
+            labels = labels.view(-1)
+            outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
 
-        LOGGER.info(f'Test evaluation is over, evaluation artifacts are: {list(test_data_loaders.keys())}')
+            # moving tensor to cpu and detaching for aggregation
+            outputs = outputs.detach().cpu().numpy()
+            labels = labels.cpu().numpy()
 
-    def freeze_classifier(self):
-        for name, param in self.model.named_parameters():
-            if 'classifier' in name:
-                param.requires_grad = False
+            evaluated_samples += len(labels)
+
+            # calculate the accuracy in the classification case
+            if not self.is_regression:
+                outputs = np.argmax(outputs, axis=1)
+                # accuracy calculation
+                accuracy_sum += accuracy_score(labels, outputs) * len(labels)
+                print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+
+            # aggregate predictions and labels
+            all_predictions.extend(list(outputs))
+            all_labels.extend(list(labels))
+        print('')
+
+        # calculate the required metrics
+        results = {}
+        for metric_name in TASK_TO_METRICS[self.task_name]:
+            metric = METRIC_NAME_TO_FUNCTION[metric_name]
+            result = metric(all_labels, all_predictions)
+            result = result[0] if self.is_regression else result
+            results[metric_name] = result
+
+        return results
+
+    @staticmethod
+    def _convert_dataset_to_data_loader(dataset, model_name, batch_size, random_sampler, test=False):
+        """converts a datasets.arrow_dataset.Dataset to torch.utils.data.DataLoader.
+
+        Args:
+            dataset (datasets.arrow_dataset.Dataset): the Dataset to convert to DataLoader.
+            model_name (str): model name (e.g. bert-base-uncased).
+            batch_size (int): batch size for training and evaluation.
+            random_sampler (bool): if True, DataLoader will sample randomly else sequentially.
+            test (bool): if True, dataset contains test samples.
+
+        Returns:
+            (torch.utils.data.DataLoader): the data loader
+        """
+        if test:
+            keys = ['input_ids', 'attention_mask', 'token_type_ids']
+        else:
+            keys = ['input_ids', 'attention_mask', 'token_type_ids', 'label']
+
+        if 'roberta' in model_name:
+            keys.remove('token_type_ids')
+
+        data = {key: list() for key in keys}
+        for sample in dataset:
+            for key in keys:
+                data[key].append(sample[key])
+
+        for k, v in data.items():
+            data[k] = torch.tensor(v)
+
+        tensor_dataset = TensorDataset(*[data[key] for key in keys])
+        data_sampler = RandomSampler(tensor_dataset) if random_sampler else SequentialSampler(tensor_dataset)
+        return DataLoader(tensor_dataset, sampler=data_sampler, batch_size=batch_size)
